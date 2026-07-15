@@ -51,6 +51,16 @@ static void onExit() {
 }
 
 extern "C" int InitializeInjection(void) {
+    /*
+     * WHY this exact function name / mechanism:
+     *   When CUDA_INJECTION64_PATH points at this .so, the CUDA driver dlopen()s
+     *   it during driver initialization (BEFORE the first context is created)
+     *   and calls InitializeInjection(). This is the officially supported
+     *   injection hook (the same one Compute Sanitizer itself uses), which
+     *   guarantees our sanitizerSubscribe() runs before any user CUDA call --
+     *   satisfying the "subscribe first" requirement without touching the
+     *   target program's source. Returning non-zero signals success.
+     */
     static bool done = false;
     if (done) return 1;
     done = true;
@@ -71,6 +81,10 @@ extern "C" int InitializeInjection(void) {
         return 0;
     }
 
+    /*
+     * Register a process-exit hook so the engine unsubscribes and prints its
+     * summary even though the target program never calls oobStop() itself.
+     */
     atexit(onExit);
     return 1; /* non-zero = success, per CUDA injection contract */
 }

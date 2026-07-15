@@ -111,6 +111,16 @@ const char* resolvePatchPath(const EngineConfig& cfg) {
 void ensurePatchesLoaded(CUcontext ctx) {
     if (g.ctxPatched.count(ctx) && g.ctxPatched[ctx]) return;
     const char* path = resolvePatchPath(g.cfg);
+    /*
+     * WHY sanitizerAddPatchesFromFile:
+     *   The device patch (oob_patch.cu) is compiled separately into a cubin
+     *   with `nvcc --compile-as-tools-patch`. It is NOT part of the user's
+     *   program, so the sanitizer must load it into the *same CUDA context*
+     *   as the user code before it can be spliced in. Patches are per-context
+     *   (that is why we key ctxPatched by CUcontext and load once per ctx):
+     *   loading twice is wasted work, and the Add/Patch family requires
+     *   serialized access (hence g.mtx is held by the caller).
+     */
     SanitizerResult r = sanitizerAddPatchesFromFile(path, ctx);
     if (r != SANITIZER_SUCCESS) {
         const char* s = nullptr; sanitizerGetResultString(r, &s);
@@ -128,17 +138,31 @@ PerLaunchBuffers& ensureBuffers(CUcontext ctx, uint32_t neededAllocs) {
 
     if (b.ctxDev == 0) {
         void* p = nullptr;
+        /*
+         * WHY sanitizerAlloc (not cudaMalloc):
+         *   This runs inside a sanitizer callback. Calling the CUDA runtime
+         *   (cudaMalloc) from a callback is unsupported and can deadlock the
+         *   application. sanitizerAlloc is the callback-safe equivalent and
+         *   returns a normal device pointer we can hand to the device patch.
+         *   This buffer holds the single OobDeviceCtx the patch reads.
+         */
         SAN_CHECK(sanitizerAlloc(ctx, &p, sizeof(OobDeviceCtx)));
         b.ctxDev = (CUdeviceptr)p;
     }
     if (b.reportDev == 0) {
         void* p = nullptr;
+        /* Callback-safe allocation of the report ring the device patch fills. */
         SAN_CHECK(sanitizerAlloc(ctx, &p,
                   sizeof(OobReport) * (size_t)g.cfg.maxReports));
         b.reportDev = (CUdeviceptr)p;
     }
     if (neededAllocs == 0) neededAllocs = 1;
     if (b.allocCap < neededAllocs) {
+        /*
+         * Grow the legal-interval table only when the current one is too
+         * small (with headroom) to avoid re-allocating every launch. Free the
+         * old buffer with sanitizerFree (callback-safe counterpart of cudaFree).
+         */
         if (b.allocDev) { SAN_CHECK(sanitizerFree(ctx, (void*)b.allocDev)); b.allocDev = 0; }
         void* p = nullptr;
         uint32_t cap = neededAllocs + 64; /* headroom */
@@ -156,7 +180,25 @@ void onResource(Sanitizer_CallbackId cbid, const void* cbdata) {
             const auto* d = (const Sanitizer_ResourceModuleData*)cbdata;
             std::lock_guard<std::mutex> lk(g.mtx);
             ensurePatchesLoaded(d->context);
-            /* select global memory accesses to be patched, then patch module */
+            /*
+             * WHY patch at MODULE_LOADED:
+             *   Instrumentation is per-CUmodule. A module contains the compiled
+             *   kernels; we must inject our patch into it *after* it is loaded
+             *   but *before* any of its kernels launch. This callback is the
+             *   exact hook for that. Doing it lazily at launch time would race
+             *   the first launch.
+             *
+             * sanitizerPatchInstructions(GLOBAL_MEMORY_ACCESS, module, name):
+             *   Tells the sanitizer "for every global load/store/atomic in this
+             *   module, call the device function `oob_global_access_cb`".
+             *   We only pick GLOBAL access (not shared/local) because global
+             *   OOB is the target of this detector; this keeps overhead down.
+             *
+             * sanitizerPatchModule(module):
+             *   Actually rewrites the module's SASS to insert the selected
+             *   callbacks. Must be called after PatchInstructions and before
+             *   the kernels run.
+             */
             SAN_CHECK(sanitizerPatchInstructions(
                 SANITIZER_INSTRUCTION_GLOBAL_MEMORY_ACCESS,
                 d->module, "oob_global_access_cb"));
@@ -166,12 +208,21 @@ void onResource(Sanitizer_CallbackId cbid, const void* cbdata) {
         case SANITIZER_CBID_RESOURCE_DEVICE_MEMORY_ALLOC: {
             const auto* d = (const Sanitizer_ResourceMemoryData*)cbdata;
             std::lock_guard<std::mutex> lk(g.mtx);
+            /*
+             * WHY track allocations here:
+             *   The device patch needs to know which address ranges are legal.
+             *   The RESOURCE domain reports every device allocation (cudaMalloc,
+             *   cudaMallocAsync, module-static memory, etc.) with its base and
+             *   size. We record base->size so we can later hand the patch a
+             *   snapshot of all live [base, base+size) intervals.
+             */
             g.liveAllocs[d->address] = d->size;
             break;
         }
         case SANITIZER_CBID_RESOURCE_DEVICE_MEMORY_FREE: {
             const auto* d = (const Sanitizer_ResourceMemoryData*)cbdata;
             std::lock_guard<std::mutex> lk(g.mtx);
+            /* Drop freed ranges so an access to freed memory is also flagged. */
             g.liveAllocs.erase(d->address);
             break;
         }
@@ -252,6 +303,14 @@ void onLaunchBegin(const Sanitizer_LaunchData* d) {
     /* upload alloc table */
     if (nAllocs > 0) {
         Sanitizer_StreamHandle hs = d->hStream;
+        /*
+         * WHY sanitizerMemcpyHostToDeviceAsync (not cudaMemcpy):
+         *   We are inside the LAUNCH_BEGIN callback. The callback-safe copy
+         *   pushes the freshly snapshotted legal-interval table onto the SAME
+         *   stream as the kernel, so it is guaranteed to land in device memory
+         *   before the kernel (and thus the patch) reads it. Using cudaMemcpy
+         *   here would be unsupported inside a callback.
+         */
         SAN_CHECK(sanitizerMemcpyHostToDeviceAsync(
             (void*)b.allocDev, host.data(),
             sizeof(OobAllocEntry) * nAllocs, hs));
@@ -259,6 +318,12 @@ void onLaunchBegin(const Sanitizer_LaunchData* d) {
 
     /* zero the report buffer & fill ctx */
     Sanitizer_StreamHandle hs = d->hStream;
+    /*
+     * WHY sanitizerMemset:
+     *   Reset the report ring (and its atomic cursor lives in ctx, reset
+     *   below) so counts from a previous launch do not leak into this one.
+     *   Callback-safe equivalent of cudaMemset, ordered on the kernel stream.
+     */
     SAN_CHECK(sanitizerMemset((void*)b.reportDev, 0,
               sizeof(OobReport) * (size_t)g.cfg.maxReports, hs));
 
@@ -271,10 +336,19 @@ void onLaunchBegin(const Sanitizer_LaunchData* d) {
     hctx.reportCursor = 0;
     hctx.abortOnError = (uint32_t)g.cfg.abortOnError;
 
+    /* Push the control block the device patch will read as its `userdata`. */
     SAN_CHECK(sanitizerMemcpyHostToDeviceAsync(
         (void*)b.ctxDev, &hctx, sizeof(hctx), hs));
 
-    /* bind ctx to this launch */
+    /*
+     * WHY sanitizerSetLaunchCallbackData:
+     *   This binds our OobDeviceCtx device pointer to THIS specific launch so
+     *   that when the patched kernel runs, every call to oob_global_access_cb
+     *   receives that pointer as `userdata`. It is per-launch (as opposed to
+     *   sanitizerSetCallbackData which is per-CUfunction) which is exactly
+     *   what we want: each launch gets a freshly reset report buffer and the
+     *   allocation snapshot valid at that moment.
+     */
     SAN_CHECK(sanitizerSetLaunchCallbackData(
         d->hLaunch, d->function, d->hStream, (const void*)b.ctxDev));
 }
@@ -290,10 +364,20 @@ void onLaunchEnd(const Sanitizer_LaunchData* d) {
         g.launchCount++;
     }
 
-    /* make sure the kernel finished writing reports */
+    /*
+     * WHY sanitizerStreamSynchronize before reading back:
+     *   The kernel (and its patch callbacks) write the report buffer
+     *   asynchronously. We must wait for the launch stream to drain so the
+     *   device writes are complete and visible before we copy them to host.
+     *   This is the callback-safe form of cudaStreamSynchronize.
+     */
     SAN_CHECK(sanitizerStreamSynchronize(d->hStream));
 
-    /* read back ctx to learn how many reports were written */
+    /*
+     * Read back the control block first to learn reportCursor: the patch used
+     * atomicAdd on it, so it tells us how many OOB accesses were ATTEMPTED
+     * (which may exceed maxReports if there were more than the buffer holds).
+     */
     OobDeviceCtx hctx;
     memset(&hctx, 0, sizeof(hctx));
     SAN_CHECK(sanitizerMemcpyDeviceToHost(
@@ -304,6 +388,7 @@ void onLaunchEnd(const Sanitizer_LaunchData* d) {
 
     uint32_t count = attempted < hctx.maxReports ? attempted : hctx.maxReports;
     std::vector<OobReport> reps(count);
+    /* Copy only the valid records back for host-side formatting/printing. */
     SAN_CHECK(sanitizerMemcpyDeviceToHost(
         reps.data(), (void*)b.reportDev,
         sizeof(OobReport) * count, d->hStream));
@@ -355,12 +440,28 @@ extern "C" int oobEngineInitEx(const char* patchCubin,
     g.cfg.maxReports   = maxReports > 0 ? maxReports : 4096;
 
     SanitizerResult r = sanitizerSubscribe(&g.subscriber, oobCallback, nullptr);
+    /*
+     * WHY sanitizerSubscribe first, before any CUDA call:
+     *   A subscriber must exist before the CUDA driver initializes / creates
+     *   the first context, otherwise early allocations and module loads are
+     *   missed and the allocation table / patches would be incomplete. Only
+     *   ONE subscriber may exist at a time (docs); we keep the handle to
+     *   unsubscribe cleanly in oobEngineShutdown.
+     */
     if (r != SANITIZER_SUCCESS) {
         const char* s = nullptr; sanitizerGetResultString(r, &s);
         fprintf(stderr, "[OOB] sanitizerSubscribe failed: %d (%s)\n",
                 (int)r, s ? s : "?");
         return (int)r;
     }
+    /*
+     * WHY enable only RESOURCE + LAUNCH domains (not all):
+     *   RESOURCE gives us module-load (to patch) and alloc/free (to build the
+     *   legal-interval table). LAUNCH gives us the per-kernel begin/end hooks
+     *   to set callback data and harvest reports. Enabling other domains
+     *   (driver/runtime API, memcpy, ...) would add callback overhead we do
+     *   not need for OOB detection.
+     */
     SAN_CHECK(sanitizerEnableDomain(1, g.subscriber, SANITIZER_CB_DOMAIN_RESOURCE));
     SAN_CHECK(sanitizerEnableDomain(1, g.subscriber, SANITIZER_CB_DOMAIN_LAUNCH));
     g.active = true;
@@ -373,6 +474,13 @@ extern "C" int oobEngineInitEx(const char* patchCubin,
 extern "C" void oobEngineShutdown(void) {
     if (!g.active) return;
     if (g.subscriber) {
+        /*
+         * WHY sanitizerUnsubscribe:
+         *   Releases the single global subscriber slot and stops all further
+         *   callbacks. Required before the process exits (or before a new
+         *   subscriber could be installed) to avoid dangling callbacks into
+         *   freed engine state.
+         */
         sanitizerUnsubscribe(g.subscriber);
         g.subscriber = nullptr;
     }

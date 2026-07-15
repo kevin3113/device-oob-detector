@@ -80,18 +80,34 @@ oob_global_access_cb(void* userdata,
 {
     OobDeviceCtx* ctx = (OobDeviceCtx*)userdata;
     if (ctx == 0 || ctx->allocBase == 0) {
-        /* engine not ready: don't interfere */
+        /*
+         * Engine not ready (no userdata bound or no allocation table): never
+         * interfere with the user's kernel. Returning SUCCESS lets the access
+         * proceed unmodified. This guards the window before the host has set
+         * up launch callback data.
+         */
         return SANITIZER_PATCH_SUCCESS;
     }
 
     unsigned long long addr = (unsigned long long)ptr;
 
-    /* A null / obviously-invalid pointer is also flagged. */
+    /*
+     * The patch runs BEFORE the actual global access (sanitizer patches memory
+     * accesses pre-execution). So this is our chance to validate the address
+     * and record a violation before the (potentially illegal) access happens.
+     * A null / obviously-invalid pointer will not be contained in any legal
+     * interval and is therefore flagged too.
+     */
     if (oob_addr_is_legal(ctx, addr, accessSize)) {
         return SANITIZER_PATCH_SUCCESS;
     }
 
-    /* Record the violation. Reserve a slot atomically. */
+    /*
+     * Record the violation. atomicAdd reserves a unique slot across all
+     * threads/warps racing here concurrently; the returned index is the
+     * ATTEMPT number. We only store it if it fits in the ring, but the cursor
+     * keeps counting so the host can report how many were dropped.
+     */
     unsigned int idx = atomicAdd(&ctx->reportCursor, 1u);
     if (idx < ctx->maxReports) {
         OobReport* reports = (OobReport*)ctx->reportBase;
@@ -106,7 +122,12 @@ oob_global_access_cb(void* userdata,
     }
 
     if (ctx->abortOnError) {
-        /* Exits the whole warp; host will still read the report buffer. */
+        /*
+         * Returning SANITIZER_PATCH_ERROR makes the sanitizer exit the whole
+         * warp of the offending thread, effectively stopping further damage.
+         * The host still reads the report buffer afterwards, so the violation
+         * is not lost. Default (0) is to keep running and collect all OOBs.
+         */
         return SANITIZER_PATCH_ERROR;
     }
     return SANITIZER_PATCH_SUCCESS;

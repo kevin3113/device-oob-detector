@@ -29,6 +29,13 @@ __global__ void vecAddBad(const float* a, const float* b, float* c,
 
 int main() {
 #ifdef OOB_EMBEDDED
+    /*
+     * WHY oobStart before any CUDA call:
+     *   It calls sanitizerSubscribe internally. The subscriber must be in
+     *   place before the driver creates the first context, otherwise the
+     *   early cudaMalloc/module-load events are missed and the detector
+     *   cannot build its legal-address table or patch the kernels.
+     */
     OobConfig cfg = OOB_CONFIG_DEFAULT;
     cfg.abortOnError = 0;
     cfg.verbose = 1;
