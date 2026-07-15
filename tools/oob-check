@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# oob-check - External (no-recompile) launcher for the device OOB detector.
+#
+# Usage:
+#   oob-check [--abort] [--quiet] [--max N] <program> [args...]
+#
+# It sets CUDA_INJECTION64_PATH to liboob_inject.so (the CUDA driver injection
+# hook), points OOB_PATCH_CUBIN at the device patch, then exec's the target.
+#
+set -euo pipefail
+
+# Directory of this script -> build dir is ../build relative to repo root.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="${OOB_BUILD_DIR:-$SCRIPT_DIR/../build}"
+
+INJECT_SO="$BUILD_DIR/liboob_inject.so"
+PATCH_CUBIN="$BUILD_DIR/oob_patch.cubin"
+
+# Locate Compute Sanitizer runtime library (libsanitizer-public.so).
+SANITIZER_DIR="${SANITIZER_DIR:-${CUDA_HOME:-/home/Cuda-13}/compute-sanitizer}"
+
+usage() { sed -n '2,12p' "$0"; exit 1; }
+
+ABORT=0
+VERBOSE=1
+MAXREP=4096
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --abort) ABORT=1; shift ;;
+        --quiet) VERBOSE=0; shift ;;
+        --max)   MAXREP="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+[[ $# -ge 1 ]] || usage
+[[ -f "$INJECT_SO" ]]  || { echo "oob-check: missing $INJECT_SO (run make)" >&2; exit 1; }
+[[ -f "$PATCH_CUBIN" ]]|| { echo "oob-check: missing $PATCH_CUBIN (run make)" >&2; exit 1; }
+
+export CUDA_INJECTION64_PATH="$INJECT_SO"
+export OOB_PATCH_CUBIN="$PATCH_CUBIN"
+export OOB_ABORT_ON_ERROR="$ABORT"
+export OOB_VERBOSE="$VERBOSE"
+export OOB_MAX_REPORTS="$MAXREP"
+export LD_LIBRARY_PATH="$SANITIZER_DIR:$BUILD_DIR:${LD_LIBRARY_PATH:-}"
+
+exec "$@"
